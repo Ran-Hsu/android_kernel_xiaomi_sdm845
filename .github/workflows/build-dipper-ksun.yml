@@ -69,31 +69,33 @@ jobs:
           needle = "SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,"
           if needle not in text:
               raise SystemExit("reboot syscall not found")
-          decl = """#ifdef CONFIG_KSU
-extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd,
-			  void __user **arg);
-#endif
-
-"""
+          decl = (
+              "#ifdef CONFIG_KSU\n"
+              "extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd,\n"
+              "\t\t\t  void __user **arg);\n"
+              "#endif\n\n"
+          )
           text = text.replace(needle, decl + needle, 1)
-          old = """{
-	struct pid_namespace *pid_ns = task_active_pid_ns(current);
-	char buffer[256];
-	int ret = 0;
-
-	/* We only trust the superuser with rebooting the system. */
-"""
-          new = """{
-	struct pid_namespace *pid_ns = task_active_pid_ns(current);
-	char buffer[256];
-	int ret = 0;
-
-#ifdef CONFIG_KSU
-	ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
-#endif
-
-	/* We only trust the superuser with rebooting the system. */
-"""
+          old = (
+              "{\n"
+              "\tstruct pid_namespace *pid_ns = task_active_pid_ns(current);\n"
+              "\tchar buffer[256];\n"
+              "\tint ret = 0;\n"
+              "\n"
+              "\t/* We only trust the superuser with rebooting the system. */\n"
+          )
+          new = (
+              "{\n"
+              "\tstruct pid_namespace *pid_ns = task_active_pid_ns(current);\n"
+              "\tchar buffer[256];\n"
+              "\tint ret = 0;\n"
+              "\n"
+              "#ifdef CONFIG_KSU\n"
+              "\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n"
+              "#endif\n"
+              "\n"
+              "\t/* We only trust the superuser with rebooting the system. */\n"
+          )
           if old not in text:
               raise SystemExit("reboot function body anchor not found")
           path.write_text(text.replace(old, new, 1))
@@ -118,7 +120,6 @@ extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd,
               Path(path).write_text(new)
               print(f"patched {path}")
 
-          # Keep declarations before the ksu call for this 4.9 C89 tree.
           must_sub(
               "fs/open.c",
               r"(SYSCALL_DEFINE3\(faccessat, int, dfd, const char __user \*, filename, int, mode\)\n\{\n)[ \t]*ksu_handle_faccessat\(&dfd, &filename, &mode, NULL\);\n((?:[ \t]+[^\n]+\n)+)",
