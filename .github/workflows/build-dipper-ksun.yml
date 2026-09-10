@@ -1,0 +1,211 @@
+name: Build dipper KernelSU-Next
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: dipper-ksun-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: dipper KernelSU-Next
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    env:
+      ARCH: arm64
+      SUBARCH: arm64
+      KBUILD_BUILD_USER: dipper
+      KBUILD_BUILD_HOST: github-actions
+      LLVM_IAS: "1"
+    steps:
+      - name: Checkout kernel
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev libncurses-dev \
+            python3 python-is-python3 zip unzip wget git ccache \
+            device-tree-compiler clang lld llvm \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
+            build-essential ca-certificates
+          which clang aarch64-linux-gnu-as arm-linux-gnueabi-as \
+            aarch64-linux-gnu-ld arm-linux-gnueabi-ld
+          clang --version
+
+      - name: Setup KernelSU-Next (legacy)
+        run: |
+          set -euo pipefail
+          rm -f drivers/kernelsu
+          sed -i '/kernelsu/d' drivers/Makefile || true
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
+          test -e drivers/kernelsu
+          test -d KernelSU-Next/kernel
+          if ! grep -qE '^[[:space:]]*obj-\$\(CONFIG_KSU\)[[:space:]]*\+=[[:space:]]*kernelsu/' drivers/Makefile; then
+            printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          fi
+          if ! grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig; then
+            sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+          fi
+          git -C KernelSU-Next log -1 --oneline
+          git -C KernelSU-Next rev-parse --abbrev-ref HEAD
+          ls -l drivers/kernelsu
+          grep -n kernelsu drivers/Makefile drivers/Kconfig
+
+      - name: Add KernelSU-Next reboot hook
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("kernel/reboot.c")
+          text = path.read_text()
+          if "ksu_handle_sys_reboot" in text:
+              print("reboot hook already present")
+              raise SystemExit(0)
+          needle = "SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,"
+          if needle not in text:
+              raise SystemExit("reboot syscall not found")
+          decl = """#ifdef CONFIG_KSU
+extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd,
+			  void __user **arg);
+#endif
+
+"""
+          text = text.replace(needle, decl + needle, 1)
+          old = """{
+	struct pid_namespace *pid_ns = task_active_pid_ns(current);
+	char buffer[256];
+	int ret = 0;
+
+	/* We only trust the superuser with rebooting the system. */
+"""
+          new = """{
+	struct pid_namespace *pid_ns = task_active_pid_ns(current);
+	char buffer[256];
+	int ret = 0;
+
+#ifdef CONFIG_KSU
+	ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
+#endif
+
+	/* We only trust the superuser with rebooting the system. */
+"""
+          if old not in text:
+              raise SystemExit("reboot function body anchor not found")
+          path.write_text(text.replace(old, new, 1))
+          print("patched kernel/reboot.c")
+          PY
+          grep -n "ksu_handle_sys_reboot" kernel/reboot.c
+
+      - name: Fix KernelSU C89 syscall hooks
+        run: |
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          def must_sub(path, pattern, repl, label):
+              text = Path(path).read_text()
+              new, n = re.subn(pattern, repl, text, count=1)
+              if n != 1:
+                  print(f"{label}: expected 1 match, got {n}; skip if already patched")
+                  if "ksu_handle_" not in text:
+                      raise SystemExit(f"{label}: missing ksu hook")
+                  return
+              Path(path).write_text(new)
+              print(f"patched {path}")
+
+          # Keep declarations before the ksu call for this 4.9 C89 tree.
+          must_sub(
+              "fs/open.c",
+              r"(SYSCALL_DEFINE3\(faccessat, int, dfd, const char __user \*, filename, int, mode\)\n\{\n)[ \t]*ksu_handle_faccessat\(&dfd, &filename, &mode, NULL\);\n((?:[ \t]+[^\n]+\n)+)",
+              r"\1\2\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n",
+              "open.c faccessat",
+          )
+          must_sub(
+              "fs/stat.c",
+              r"(int vfs_fstatat\(int dfd, const char __user \*filename, struct kstat \*stat,\n[ \t]*int flag\)\n\{\n)[ \t]*ksu_handle_stat\(&dfd, &filename, &flags\);\n((?:[ \t]+[^\n]+\n)+)",
+              r"\1\2\n\tksu_handle_stat(&dfd, &filename, &flag);\n",
+              "stat.c vfs_fstatat",
+          )
+          PY
+
+      - name: Merge dipper defconfig
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          CFG=arch/arm64/configs/vendor/xiaomi/mi845_defconfig
+          for opt in CONFIG_KSU=y CONFIG_KSU_MANUAL_HOOK=y CONFIG_OVERLAY_FS=y; do
+            key="${opt%=*}"
+            if grep -q "^${key}=" "$CFG"; then
+              sed -i "s|^${key}=.*|${opt}|" "$CFG"
+            else
+              printf '\n%s\n' "$opt" >> "$CFG"
+            fi
+          done
+          sed -i 's|--prefix=$(GCC_TOOLCHAIN32_DIR)|--prefix=$(GCC_TOOLCHAIN32_DIR)$(notdir $(CROSS_COMPILE_ARM32))|' arch/arm64/Makefile
+          cat arch/arm64/configs/vendor/xiaomi/mi845_defconfig \
+              arch/arm64/configs/vendor/xiaomi/dipper.config \
+              > arch/arm64/configs/dipper_ksun_defconfig
+          make O=out ARCH=arm64 LLVM_IAS=1 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            dipper_ksun_defconfig
+          grep -E 'CONFIG_KSU|CONFIG_OVERLAY_FS|CONFIG_MACH_XIAOMI_E1N|CONFIG_COMPAT_VDSO' out/.config
+
+      - name: Build kernel
+        run: |
+          set -euo pipefail
+          make O=out ARCH=arm64 LLVM_IAS=1 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip LD=ld.lld \
+            -j"$(nproc)"
+          test -f out/arch/arm64/boot/Image.gz-dtb
+          ls -lh out/arch/arm64/boot/Image.gz-dtb
+
+      - name: Pack AnyKernel3
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3
+          rm -rf ak3/.git ak3/.github
+          cat > ak3/anykernel.sh <<'EOF'
+          # AnyKernel3 Ramdisk Mod Script
+          properties() { '
+          kernel.string=dipper LineageOS KernelSU-Next
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=dipper
+          device.name2=MI 8
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
+          block=boot
+          is_slot_device=auto
+          ramdisk_compression=auto
+          patch_vbmeta_flag=auto
+          . tools/ak3-core.sh
+          dump_boot
+          write_boot
+          EOF
+          sed -i 's/^          //' ak3/anykernel.sh
+          cp out/arch/arm64/boot/Image.gz-dtb ak3/
+          mkdir -p artifacts
+          (cd ak3 && zip -r9 ../artifacts/dipper-lineage-ksun.zip .)
+          cp out/arch/arm64/boot/Image.gz-dtb artifacts/
+          ls -lh artifacts
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dipper-ksun-legacy
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 14
