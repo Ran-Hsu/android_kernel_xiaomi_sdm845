@@ -55,8 +55,35 @@ jobs:
           if ! grep -q '^CONFIG_OVERLAY_FS=y' arch/arm64/configs/vendor/xiaomi/mi845_defconfig; then
             printf 'CONFIG_OVERLAY_FS=y\n' >> arch/arm64/configs/vendor/xiaomi/mi845_defconfig
           fi
-          # Clang looks for $(prefix)as; include ARM32 GNU prefix so it finds arm-linux-gnueabi-as
           sed -i 's|--prefix=$(GCC_TOOLCHAIN32_DIR)|--prefix=$(GCC_TOOLCHAIN32_DIR)$(notdir $(CROSS_COMPILE_ARM32))|' arch/arm64/Makefile
+
+      - name: Fix KernelSU C89 syscall hooks
+        run: |
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          def must_sub(path, pattern, repl, label):
+              text = Path(path).read_text()
+              new, n = re.subn(pattern, repl, text, count=1)
+              if n != 1:
+                  raise SystemExit(f"{label}: expected 1 match, got {n}")
+              Path(path).write_text(new)
+              print(f"patched {path}")
+
+          must_sub(
+              "fs/open.c",
+              r"(SYSCALL_DEFINE3\(faccessat, int, dfd, const char __user \*, filename, int, mode\)\n\{\n)[ \t]*ksu_handle_faccessat\(&dfd, &filename, &mode, NULL\);\n((?:[ \t]+[^\n]+\n)+)",
+              r"\1\2\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n",
+              "open.c faccessat",
+          )
+          must_sub(
+              "fs/stat.c",
+              r"(int vfs_fstatat\(int dfd, const char __user \*filename, struct kstat \*stat,\n[ \t]*int flag\)\n\{\n)[ \t]*ksu_handle_stat\(&dfd, &filename, &flags\);\n((?:[ \t]+[^\n]+\n)+)",
+              r"\1\2\n\tksu_handle_stat(&dfd, &filename, &flag);\n",
+              "stat.c vfs_fstatat",
+          )
+          PY
 
       - name: Merge dipper defconfig
         run: |
